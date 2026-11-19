@@ -59,4 +59,6 @@
 
 ## License
 
-MIT
+本项目采用 **GNU 通用公共许可证 v3.0（GPL-3.0）** 开源：你可以自由使用、修改和分发，但分发时（包括修改后的版本）必须同样以 GPL-3.0 开源，并保留版权声明。许可证全文见 [LICENSE](LICENSE)。
+
+Copyright (C) 2026 Bojingwen
