@@ -1,0 +1,8 @@
+# Real credentials must never be committed (use assets/config/bridge.example.json as the template)
+config/bridge.json
+# Runtime state of a deployed bridge
+bridge-data/
+logs/
+bin/
+run/
+*.zip
