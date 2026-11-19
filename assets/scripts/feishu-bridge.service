@@ -1,0 +1,37 @@
+[Unit]
+Description=Feishu (Lark) <-> Muse bridge (long-connection, no public callback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/bin/feishubridge -conf=__INSTALL_DIR__/config/bridge.json -root=__INSTALL_DIR__/bridge-data
+# Pin HOME to the deploying user's home. A systemd service does not get
+# the user's shell environment; with a wrong HOME and no -root flag the
+# daemon once derived a nested wrong data directory and wrote incoming
+# messages where the wake-up hook never looks (messages arrived at the
+# daemon but Muse was never woken). Both pins together prevent that.
+Environment=HOME=__HOME_DIR__
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+StandardOutput=append:__INSTALL_DIR__/logs/bridge.log
+StandardError=append:__INSTALL_DIR__/logs/bridge.log
+# IMPORTANT (learned the hard way): if this machine reaches the internet
+# through a proxy — check whether the agent shell has http_proxy /
+# https_proxy set — the systemd service does NOT inherit that environment.
+# Without it the daemon's Feishu WebSocket connect fails with
+# "tls: first record does not look like a TLS handshake".
+# Uncomment and fill from the shell's current values when a proxy exists:
+# Environment=http_proxy=http://PROXY_HOST:PORT
+# Environment=https_proxy=http://PROXY_HOST:PORT
+# Environment=HTTP_PROXY=http://PROXY_HOST:PORT
+# Environment=HTTPS_PROXY=http://PROXY_HOST:PORT
+# Environment=all_proxy=http://PROXY_HOST:PORT
+# Environment=ALL_PROXY=http://PROXY_HOST:PORT
+# Environment=no_proxy=localhost,127.0.0.1
+
+[Install]
+WantedBy=default.target
