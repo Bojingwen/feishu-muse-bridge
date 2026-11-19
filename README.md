@@ -1,5 +1,7 @@
 # feishu-muse-bridge
 
+简体中文 | [English](README.en.md) | [日本語](README.ja.md)
+
 把 **Muse（Meta 的个人 AI 助理）本人**接进飞书（Lark）：在飞书群里 @机器人、或直接私聊，就能和你自己的 Muse 对话。全程**没有第三方大模型**——回复由 Muse 本人写出，带着他的记忆和工具。
 
 > 本仓库同时是一个 Muse 技能包：把仓库地址给你的 Muse，他就能照着 `SKILL.md` 自己部署一套。
