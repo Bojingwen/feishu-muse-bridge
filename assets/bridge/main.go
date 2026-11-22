@@ -6,6 +6,8 @@
 // Flow:
 //   Feishu group --(@bot, long-connection WS)--> this daemon
 //     --> bridge-data/inbox/<message_id>.json
+//     (file / image / audio / video messages are downloaded to
+//      bridge-data/files/<message_id>/ and listed in the inbox JSON)
 //     --> a Muse hook notices the file and wakes a Muse worker
 //     --> Muse writes bridge-data/outbox/<message_id>.json
 //     --> this daemon updates its "thinking" placeholder in Feishu
@@ -22,6 +24,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +60,17 @@ type InboxMsg struct {
 	// history after an outage (Feishu never redelivers events missed
 	// while the long connection is down, so the bridge polls for them).
 	Recovered bool `json:"recovered,omitempty"`
+	// Attachments are files the user sent with (or as) this message,
+	// downloaded by the daemon at receive time; see fetchAttachment.
+	Attachments []InAttachment `json:"attachments,omitempty"`
+}
+
+// InAttachment is one user-sent file, downloaded to local disk.
+type InAttachment struct {
+	Kind  string `json:"kind"` // file | image | audio | video
+	Name  string `json:"name"`
+	Path  string `json:"path,omitempty"`  // local path when the download worked
+	Error string `json:"error,omitempty"` // why the download failed, when it did
 }
 
 type Attachment struct {
@@ -416,8 +430,14 @@ func onMessage(ctx context.Context, msg *larkim.P2MessageReceiveV1) error {
 	if chatType == "group" && !atBot {
 		return nil // group chats: only when @'d
 	}
-	if strings.TrimSpace(text) == "" {
-		return nil // nothing to answer (sticker/image-only etc.)
+	// File / image / audio / video messages carry no text; download
+	// what the user sent so Muse can actually read it.
+	var atts []InAttachment
+	if att := fetchAttachment(ctx, msgID, larkcore.StringValue(msg.Event.Message.MessageType), larkcore.StringValue(msg.Event.Message.Content)); att != nil {
+		atts = append(atts, *att)
+	}
+	if strings.TrimSpace(text) == "" && len(atts) == 0 {
+		return nil // nothing to answer (sticker etc.)
 	}
 
 	chatID := larkcore.StringValue(msg.Event.Message.ChatId)
@@ -430,8 +450,108 @@ func onMessage(ctx context.Context, msg *larkim.P2MessageReceiveV1) error {
 	enqueue(ctx, InboxMsg{
 		ID: msgID, ChatID: chatID, ChatType: chatType, SenderID: senderID,
 		Text: text, ReceivedAt: time.Now().Format(time.RFC3339),
+		Attachments: atts,
 	})
 	return nil
+}
+
+// --- inbound attachments --------------------------------------------
+// Events for file / image / audio / media messages carry only a key;
+// the bytes live behind the message-resource API. Download them at
+// receive time so the worker can read what the user actually sent
+// (before this, a file sent in Feishu simply never reached Muse).
+// A size cap keeps a huge file from filling the disk, and a failed
+// download rides along in the inbox entry as an error instead of
+// silently dropping the user's file.
+
+const maxInAttachmentBytes = 100 << 20 // 100 MB
+
+func sanitizeFileName(name, fallback string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	name = strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r < 0x20 {
+			return '_'
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." {
+		return fallback
+	}
+	return name
+}
+
+func fetchAttachment(ctx context.Context, msgID, msgType, content string) *InAttachment {
+	var body struct {
+		FileKey  string `json:"file_key"`
+		FileName string `json:"file_name"`
+		ImageKey string `json:"image_key"`
+	}
+	if err := json.Unmarshal([]byte(content), &body); err != nil {
+		return nil
+	}
+	att := &InAttachment{Name: body.FileName}
+	dlType := "file"
+	switch msgType {
+	case larkim.MsgTypeFile:
+		att.Kind = "file"
+	case larkim.MsgTypeAudio:
+		att.Kind = "audio"
+	case larkim.MsgTypeMedia:
+		att.Kind = "video"
+	case larkim.MsgTypeImage:
+		att.Kind = "image"
+		dlType = "image"
+		body.FileKey = body.ImageKey
+	default:
+		return nil
+	}
+	if body.FileKey == "" {
+		return nil
+	}
+	resp, err := larkCli.Im.MessageResource.Get(ctx, larkim.NewGetMessageResourceReqBuilder().
+		MessageId(msgID).FileKey(body.FileKey).Type(dlType).Build())
+	if err != nil || resp == nil || !resp.Success() || resp.File == nil {
+		att.Error = fmt.Sprintf("download failed (err=%v)", err)
+		if resp != nil && !resp.Success() {
+			att.Error = fmt.Sprintf("download failed (code=%d msg=%s)", resp.Code, resp.Msg)
+		}
+		if att.Name == "" {
+			att.Name = att.Kind + " (unnamed)"
+		}
+		logf("attachment download fail msg=%s kind=%s: %s", msgID, att.Kind, att.Error)
+		return att
+	}
+	if att.Name == "" {
+		att.Name = resp.FileName
+	}
+	name := sanitizeFileName(att.Name, att.Kind+"_"+msgID)
+	dir := filepath.Join(rootDir, "files", msgID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		att.Error = "store failed: " + err.Error()
+		return att
+	}
+	dst := filepath.Join(dir, name)
+	f, err := os.Create(dst)
+	if err != nil {
+		att.Error = "store failed: " + err.Error()
+		return att
+	}
+	written, copyErr := io.Copy(f, io.LimitReader(resp.File, maxInAttachmentBytes+1))
+	f.Close()
+	if copyErr != nil || written > maxInAttachmentBytes {
+		os.Remove(dst)
+		if copyErr != nil {
+			att.Error = "store failed: " + copyErr.Error()
+		} else {
+			att.Error = "file larger than 100 MB, not downloaded"
+		}
+		logf("attachment store fail msg=%s: %s", msgID, att.Error)
+		return att
+	}
+	att.Name = name
+	att.Path = dst
+	logf("attachment saved msg=%s kind=%s name=%q bytes=%d", msgID, att.Kind, name, written)
+	return att
 }
 
 // enqueue hands one user message to Muse: inbox file, history entry,
@@ -451,7 +571,11 @@ func enqueue(ctx context.Context, in InboxMsg) {
 		logf("rename inbox fail: %v", err)
 		return
 	}
-	appendHistory(in.ChatID, "user", in.Text)
+	histText := in.Text
+	if histText == "" && len(in.Attachments) > 0 {
+		histText = "[attachment: " + in.Attachments[0].Name + "]"
+	}
+	appendHistory(in.ChatID, "user", histText)
 	if in.Recovered {
 		logf("inbox <- %s chat=%s text=%q (recovered after outage)", msgID, in.ChatID, in.Text)
 	} else {
@@ -627,7 +751,13 @@ func sweepMissed(ctx context.Context, lookback time.Duration) {
 					}
 					continue
 				}
-				if strings.TrimSpace(text) == "" {
+				var itemAtts []InAttachment
+				if item.Body != nil {
+					if att := fetchAttachment(ctx, msgID, larkcore.StringValue(item.MsgType), larkcore.StringValue(item.Body.Content)); att != nil {
+						itemAtts = append(itemAtts, *att)
+					}
+				}
+				if strings.TrimSpace(text) == "" && len(itemAtts) == 0 {
 					markSeen(msgID)
 					continue
 				}
@@ -639,7 +769,7 @@ func sweepMissed(ctx context.Context, lookback time.Duration) {
 					ID: msgID, ChatID: chatID, ChatType: chatType,
 					SenderID: larkcore.StringValue(item.Sender.Id),
 					Text: text, ReceivedAt: created.Format(time.RFC3339),
-					Recovered: true,
+					Recovered: true, Attachments: itemAtts,
 				})
 			}
 			if !larkcore.BoolValue(resp.Data.HasMore) {
@@ -659,12 +789,17 @@ func sweepMissed(ctx context.Context, lookback time.Duration) {
 			recovered++
 		} else if len(cands) > 1 {
 			var lines []string
+			var mergedAtts []InAttachment
 			for _, c := range cands {
-				lines = append(lines, c.Text)
+				if c.Text != "" {
+					lines = append(lines, c.Text)
+				}
+				mergedAtts = append(mergedAtts, c.Attachments...)
 				markSeen(c.ID)
 			}
 			merged := cands[len(cands)-1]
 			merged.Text = strings.Join(lines, "\n")
+			merged.Attachments = mergedAtts
 			enqueue(ctx, merged)
 			recovered += len(cands)
 			logf("sweep: chat %s: merged %d missed messages into one catch-up entry", chatID, len(cands))
@@ -971,7 +1106,7 @@ func main() {
 		*root = filepath.Join(home, "workspace", "feishu-bridge", "bridge-data")
 	}
 	rootDir = *root
-	for _, sub := range []string{"inbox", "outbox", "claimed", "done", "sent", "history"} {
+	for _, sub := range []string{"inbox", "outbox", "claimed", "done", "sent", "history", "files"} {
 		os.MkdirAll(filepath.Join(rootDir, sub), 0755)
 	}
 	if *confPath == "" {
