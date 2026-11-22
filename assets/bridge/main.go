@@ -1,7 +1,7 @@
 // feishubridge: Feishu (Lark) <-> Muse bridge daemon.
 //
-// Purpose (per Andy, 2026-11-18): Andy talks to Muse *himself* from a
-// Feishu group. No third-party LLM is involved anywhere in this program.
+// Purpose: the user talks to Muse *himself* from a Feishu group.
+// No third-party LLM is involved anywhere in this program.
 //
 // Flow:
 //   Feishu group --(@bot, long-connection WS)--> this daemon
@@ -482,8 +482,7 @@ func enqueue(ctx context.Context, in InboxMsg) {
 // Feishu long connections are push-only: events that occur while the
 // client is offline (VM replacement, process death, WS drop) are never
 // redelivered — the message is simply gone. The WeChat iLink bridge
-// Andy compares this to never loses messages because its server holds
-// a poll cursor. The equivalent fix here: after any outage, fetch each
+// never loses messages because its server holds a poll cursor. The equivalent fix here: after any outage, fetch each
 // known chat's recent history through the message-list API and enqueue
 // whatever the live path missed. The seen registry dedupes, so the
 // sweep can run on a timer as well as at startup. Group chats need the
@@ -969,14 +968,14 @@ func main() {
 
 	home, _ := os.UserHomeDir()
 	if *root == "" {
-		*root = filepath.Join(home, "workspace", "musebot-lark", "bridge-data")
+		*root = filepath.Join(home, "workspace", "feishu-bridge", "bridge-data")
 	}
 	rootDir = *root
 	for _, sub := range []string{"inbox", "outbox", "claimed", "done", "sent", "history"} {
 		os.MkdirAll(filepath.Join(rootDir, sub), 0755)
 	}
 	if *confPath == "" {
-		*confPath = filepath.Join(home, "workspace", "musebot-lark", "config", "bridge.json")
+		*confPath = filepath.Join(home, "workspace", "feishu-bridge", "config", "bridge.json")
 	}
 	data, err := os.ReadFile(*confPath)
 	if err != nil {
