@@ -28,6 +28,7 @@ Replies take tens of seconds (poll + thinking time) and arrive as one whole mess
 - **No public endpoint**: Feishu long-connection mode — no domain, public IP, or tunneling needed
 - **Groups answer on @ only, DMs answer directly**; a plain-text `@botname` (with no mentions array) is recognised too
 - **Attachments out**: images, video, and files; video is remuxed to faststart with a first-frame cover (without it, some Feishu clients show the video as unplayable)
+- **Attachments in**: files, images, voice messages and videos sent by the user are downloaded locally and handed to Muse to read (100 MB cap per file; a failed download is flagged in the message, never silently dropped)
 - **Anti-loop**: the bot never triggers on its own messages
 - **Persisted placeholders**: after a daemon restart, a "thinking…" placeholder is still correctly replaced by the reply
 - **Self-healing watchdog**: the wake-up hook checks the bridge's whole supervision chain on every 10s poll — a systemd unit wiped by a machine replacement is reinstalled, a stopped service is started, a dead-inside connection is restarted, and the user gets a one-line report after a repair
@@ -43,7 +44,7 @@ Before the bridge can work, set up the app on the Feishu Open Platform. Every st
 4. **Grant permissions** (add each one under "Permission management"):
    - `im:message` — send and receive messages (the core permission; without it nothing arrives)
    - `im:message.p2p_msg:readonly` — receive private-chat messages (without it you get "group works, DM doesn't")
-   - `im:resource` — send images, video, and files
+   - `im:resource` — send and download images, video, and files
 5. **Configure event subscription** (on the "Event subscription" page):
    - Receiving mode: **"Use long connection to receive events"** (this is what removes the need for a public IP or callback URL)
    - Add the event: **Receive message `im.message.receive_v1`**

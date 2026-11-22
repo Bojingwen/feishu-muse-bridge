@@ -204,6 +204,14 @@ copy secrets into the skill, memory files, or chat.
   `~/workspace`). Images go through `im/v1/images`, files through
   `im/v1/files` (`.xlsx`→file_type `xls`, `.mp4` video is sent as a `media`
   message).
+- **Attachments in**: file / image / audio / media messages carry only a
+  key in the event; the daemon downloads the bytes through the
+  message-resource API at receive time (100 MB cap) into
+  `bridge-data/files/<message_id>/` and lists them in the inbox JSON as
+  `attachments: [{kind, name, path}]`, so the worker can read what the
+  user sent. A failed download sets `error` on the entry instead of a
+  path — the worker tells the user the file did not arrive rather than
+  ignoring it. The catch-up sweep downloads the same way.
 - **Video fix**: before sending a video the daemon remuxes it with
   `ffmpeg -movflags +faststart` and extracts a first-frame cover
   (`image_key`). Without faststart + cover, several Feishu mobile clients
