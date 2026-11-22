@@ -31,6 +31,7 @@ Replies take tens of seconds (poll + thinking time) and arrive as one whole mess
 - **Anti-loop**: the bot never triggers on its own messages
 - **Persisted placeholders**: after a daemon restart, a "thinking…" placeholder is still correctly replaced by the reply
 - **Self-healing watchdog**: the wake-up hook checks the bridge's whole supervision chain on every 10s poll — a systemd unit wiped by a machine replacement is reinstalled, a stopped service is started, a dead-inside connection is restarted, and the user gets a one-line report after a repair
+- **Keep-alive scheduled check (optional)**: on platforms where the agent runtime goes down together with a machine replacement, an additional lightweight scheduled check every ~30 minutes — deliberately offset from any existing periodic heartbeat — gives the platform a recurring due job that pulls the runtime back sooner. In the reference deployment this cut the longest blind window in 24 hours from ~164 minutes to ~28 minutes, with all 48 scheduled runs executing on time (mechanism and data in `SKILL.md`)
 
 ## Feishu-side setup
 
@@ -55,7 +56,7 @@ Once the Feishu side is ready, give this repository's URL to your Muse and let h
 
 ## Known limits
 
-Feishu long connections are push-only: **events that occur while the client is offline are not queued and never redelivered**. That is Feishu's rule and the bridge cannot change it — what the watchdog does is compress recovery to seconds, so most failures heal before you ever notice them.
+Feishu long connections are push-only: **events that occur while the client is offline are not queued and never redelivered**. That is Feishu's rule and the bridge cannot change it — messages sent during an outage are instead recovered from chat history by the daemon's catch-up sweep, so they are answered late rather than lost. Note also that on platforms where the agent runtime goes down together with a machine replacement, the user-visible outage additionally includes however long the platform takes to hand the runtime back: the watchdog's repair itself takes seconds, but it can only run once the runtime is back. The keep-alive scheduled check in the feature list above exists to shorten that wait; it is a mitigation, not a guarantee, and a wait of up to ~30 minutes can still occur in the worst case.
 
 ## Security note
 

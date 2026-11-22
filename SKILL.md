@@ -130,6 +130,14 @@ copy secrets into the skill, memory files, or chat.
    appears, then turns into Muse's reply within ~a minute. Also test one
    attachment round (ask Muse in Feishu to send an image / a 2s video /
    a spreadsheet).
+8. **(Optional, recommended on ephemeral hosts) Register the keep-alive
+   scheduled check**: with the cron tools, add an interval job every
+   30 minutes whose whole task is to run
+   `systemctl is-active feishu-bridge`, report one line to the user only
+   when the service is not active, and otherwise finish silently. Anchor
+   its first run so its slots fall between any existing periodic
+   heartbeat slots — see "Keep-alive scheduled check" under "Built-in
+   behaviours" for why, and for the measured effect.
 
 ## Built-in behaviours worth knowing
 
@@ -148,6 +156,43 @@ copy secrets into the skill, memory files, or chat.
   loss-proof: Feishu long connections are push-only and never
   redeliver events missed while the client is offline, so supervision
   that heals in seconds is the strongest available substitute.
+- **Catch-up sweep** (missed messages are recovered, not lost): because
+  Feishu never redelivers, the daemon polls each known chat's history
+  through the message-list API — 24h lookback shortly after startup,
+  then a 30min lookback every 2 minutes — and enqueues user messages
+  the live path never saw (marked `"recovered": true` in the inbox
+  JSON, with their original send time). When several messages from
+  one chat piled up during an outage, the sweep merges them into ONE
+  catch-up entry (texts joined in time order, keyed by the latest
+  message), so a single Muse turn answers the whole backlog instead
+  of draining it turn by turn. A persistent seen registry
+  (`bridge-data/seen.json`, seeded from the queue dirs) dedupes, and
+  chat types (`bridge-data/chats.json`) are learned from live events;
+  the chat-info API can also resolve them but needs the
+  `im:chat:readonly` scope. A chat whose type is only guessed is
+  treated as a group for gating, but its skipped messages are NOT
+  marked seen — a guess must never eat a direct message. Scope note:
+  listing **group** history needs `im:message.group_msg`; without it
+  the sweep logs the refusal (throttled) and covers p2p chats only.
+- **Keep-alive scheduled check** (recommended where the agent runtime
+  is ephemeral): the watchdog can only run while the Muse runtime is
+  alive, and on hosts where a VM / container replacement takes the
+  runtime down together with the machine, the user-visible outage is
+  however long the platform takes to hand the runtime back — the repair
+  itself takes seconds, the wait for the runtime may not. A lightweight
+  scheduled task that checks `systemctl is-active feishu-bridge` every
+  ~30 minutes gives the platform a recurring due job, and due jobs
+  appear to pull the runtime back sooner. In the reference deployment
+  this cut the longest blind window in 24 hours from ~164 minutes to
+  ~28 minutes: all 48 scheduled runs executed, none more than about a
+  minute late, while on the baseline day several due jobs had been
+  skipped entirely and one ran 27 minutes late. Deliberately offset the
+  check from any existing periodic heartbeat (e.g. heartbeat at
+  :16/:46, check at :01/:31) so a job falls due roughly every
+  15 minutes. This is a mitigation, not a guarantee — a replacement
+  that lands just after a check can still leave a wait of up to
+  ~30 minutes — and the catch-up sweep, not this check, is what
+  prevents message loss.
 - **Anti-loop**: events with `sender_type=app` are dropped; every message
   the daemon sends is registered for 10 minutes and dropped if it echoes
   back. The bot never reacts to itself.
@@ -170,13 +215,19 @@ copy secrets into the skill, memory files, or chat.
 ## Troubleshooting
 
 - *Bridge was down for a while; messages sent meanwhile are gone* →
-  expected behaviour of Feishu long connections: events are **not**
-  queued or redelivered for an offline client. Tell the user plainly
-  which window was lost and ask them to resend. Prevention is the
+  Feishu long-connection events are **not** queued or redelivered for
+  an offline client, but the catch-up sweep (see "Built-in behaviours")
+  fetches missed messages from chat history once the bridge is back —
+  for p2p chats they are answered late instead of lost. Group chats
+  are covered only with the `im:message.group_msg` scope; without it,
+  tell the user plainly which group window was lost and ask them to
+  resend. Prevention is the
   systemd setup in step 6 (auto-start + Restart=always + proxy env)
   plus the watchdog in the hook script, which heals a wiped unit,
   a stopped service, or a dead-inside daemon within seconds of the
-  machine being back — check `~/hooks/state/feishu-bridge-watchdog.state`
+  machine being back; the keep-alive scheduled check (step 8)
+  additionally shortens the wait for the runtime itself on hosts where
+  a replacement takes the runtime down too — check `~/hooks/state/feishu-bridge-watchdog.state`
   and the hook log for its repair records before assuming a long
   outage went unnoticed.
 - *Daemon running under systemd but WebSocket connect fails with
