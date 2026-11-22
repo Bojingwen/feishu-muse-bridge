@@ -1,7 +1,7 @@
 // feishubridge: Feishu (Lark) <-> Muse bridge daemon.
 //
-// Purpose: the user talks to Muse *himself* from Feishu (group or DM).
-// No third-party LLM is involved anywhere in this program.
+// Purpose (per Andy, 2026-11-18): Andy talks to Muse *himself* from a
+// Feishu group. No third-party LLM is involved anywhere in this program.
 //
 // Flow:
 //   Feishu group --(@bot, long-connection WS)--> this daemon
@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,10 @@ type InboxMsg struct {
 	SenderName string `json:"sender_name,omitempty"`
 	Text       string `json:"text"`
 	ReceivedAt string `json:"received_at"`
+	// Recovered marks messages the catch-up sweep fetched from chat
+	// history after an outage (Feishu never redelivers events missed
+	// while the long connection is down, so the bridge polls for them).
+	Recovered bool `json:"recovered,omitempty"`
 }
 
 type Attachment struct {
@@ -78,7 +83,7 @@ var (
 // pendingPath is where the placeholder map is persisted. The map must
 // survive daemon restarts: without it, a restart leaves the chat's
 // "thinking…" placeholder stuck forever and replies arrive as separate
-// messages (a restart mid-conversation used to strand them).
+// messages (seen live 2026-11-19 after a mid-conversation restart).
 func pendingPath() string { return filepath.Join(rootDir, "pending.json") }
 
 func loadPending() {
@@ -105,6 +110,170 @@ func savePending() {
 	if err := os.WriteFile(tmp, data, 0644); err == nil {
 		os.Rename(tmp, pendingPath())
 	}
+}
+
+// --- seen registry: every user message_id already handed to Muse ---
+// Persisted so the catch-up sweep never re-enqueues a message that was
+// already processed before a restart. Seeded on first run from the
+// queue directories, whose filenames are message_ids.
+var (
+	seenMu  sync.Mutex
+	seenIDs = map[string]int64{} // message_id -> unix seconds when seen
+)
+
+func seenPath() string { return filepath.Join(rootDir, "seen.json") }
+
+func loadSeen() {
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	if data, err := os.ReadFile(seenPath()); err == nil {
+		m := map[string]int64{}
+		if err := json.Unmarshal(data, &m); err == nil {
+			seenIDs = m
+		}
+	}
+	if len(seenIDs) == 0 {
+		now := time.Now().Unix()
+		seed := func(dir string, stripPrefix bool) {
+			entries, _ := os.ReadDir(filepath.Join(rootDir, dir))
+			for _, e := range entries {
+				name := e.Name()
+				if !strings.HasSuffix(name, ".json") {
+					continue
+				}
+				id := strings.TrimSuffix(name, ".json")
+				if stripPrefix && len(id) > 16 { // sent/: "20060102-150405-<id>"
+					id = id[16:]
+				}
+				if strings.HasPrefix(id, "om_") {
+					seenIDs[id] = now
+				}
+			}
+		}
+		seed("inbox", false)
+		seed("claimed", false)
+		seed("done", false)
+		seed("sent", true)
+		if len(seenIDs) > 0 {
+			logf("seen registry seeded with %d ids from queue dirs", len(seenIDs))
+			saveSeenLocked()
+		}
+	}
+	// Prune entries older than 7 days so the file stays small.
+	cutoff := time.Now().Add(-7 * 24 * time.Hour).Unix()
+	for id, ts := range seenIDs {
+		if ts < cutoff {
+			delete(seenIDs, id)
+		}
+	}
+}
+
+func saveSeenLocked() {
+	data, err := json.Marshal(seenIDs)
+	if err != nil {
+		return
+	}
+	tmp := seenPath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err == nil {
+		os.Rename(tmp, seenPath())
+	}
+}
+
+func isSeen(id string) bool {
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	_, ok := seenIDs[id]
+	return ok
+}
+
+func markSeen(id string) {
+	if id == "" {
+		return
+	}
+	seenMu.Lock()
+	seenIDs[id] = time.Now().Unix()
+	saveSeenLocked()
+	seenMu.Unlock()
+}
+
+// --- chat registry: chat_id -> "group" | "p2p", learned from live
+// events and the chat-info API; the sweep needs it for the group @ rule.
+var (
+	chatsMu   sync.Mutex
+	chatTypes = map[string]string{}
+)
+
+func chatsPath() string { return filepath.Join(rootDir, "chats.json") }
+
+func loadChats() {
+	data, err := os.ReadFile(chatsPath())
+	if err != nil {
+		return
+	}
+	chatsMu.Lock()
+	json.Unmarshal(data, &chatTypes)
+	chatsMu.Unlock()
+}
+
+func noteChatType(chatID, chatType string) {
+	if chatID == "" || chatType == "" {
+		return
+	}
+	chatsMu.Lock()
+	if chatTypes[chatID] != chatType {
+		chatTypes[chatID] = chatType
+		data, _ := json.Marshal(chatTypes)
+		tmp := chatsPath() + ".tmp"
+		if err := os.WriteFile(tmp, data, 0644); err == nil {
+			os.Rename(tmp, chatsPath())
+		}
+	}
+	chatsMu.Unlock()
+}
+
+// chatTypeOf resolves a chat's type. The bool reports whether the
+// answer is certain (learned from a live event or the chat-info API).
+// The chat-info API needs the im:chat:readonly scope; without it an
+// unknown chat falls back to "group" but UNCERTAIN — and the sweep
+// must not permanently skip that chat's messages based on a guess
+// (a p2p chat misread as group would silently eat direct messages).
+func chatTypeOf(ctx context.Context, chatID string) (string, bool) {
+	chatsMu.Lock()
+	t, ok := chatTypes[chatID]
+	chatsMu.Unlock()
+	if ok {
+		return t, true
+	}
+	if resp, err := larkCli.Im.Chat.Get(ctx, larkim.NewGetChatReqBuilder().ChatId(chatID).Build()); err == nil && resp.Success() && resp.Data != nil {
+		t = "group"
+		if larkcore.StringValue(resp.Data.ChatMode) == "p2p" {
+			t = "p2p"
+		}
+		noteChatType(chatID, t)
+		return t, true
+	}
+	return "group", false
+}
+
+func knownChats() []string {
+	set := map[string]bool{}
+	chatsMu.Lock()
+	for id := range chatTypes {
+		set[id] = true
+	}
+	chatsMu.Unlock()
+	entries, _ := os.ReadDir(filepath.Join(rootDir, "history"))
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".jsonl") {
+			set[strings.TrimSuffix(e.Name(), ".jsonl")] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func logf(format string, args ...interface{}) {
@@ -192,7 +361,7 @@ func extractText(msg *larkim.P2MessageReceiveV1) (string, bool) {
 		}
 		if botName != "" {
 			// Some clients send "@botname" as plain text with no mentions
-			// array; count that as an @ too.
+			// array (seen live 2026-11-18); count that as an @ too.
 			if strings.Contains(text, "@"+botName) {
 				atBot = true
 			}
@@ -257,23 +426,37 @@ func onMessage(ctx context.Context, msg *larkim.P2MessageReceiveV1) error {
 		senderID = larkcore.StringValue(msg.Event.Sender.SenderId.UserId)
 	}
 
-	in := InboxMsg{
+	noteChatType(chatID, chatType)
+	enqueue(ctx, InboxMsg{
 		ID: msgID, ChatID: chatID, ChatType: chatType, SenderID: senderID,
 		Text: text, ReceivedAt: time.Now().Format(time.RFC3339),
-	}
+	})
+	return nil
+}
+
+// enqueue hands one user message to Muse: inbox file, history entry,
+// seen registry, and the "thinking…" placeholder the reply later
+// replaces. Used by the live event path and by the catch-up sweep.
+func enqueue(ctx context.Context, in InboxMsg) {
+	msgID := in.ID
+	markSeen(msgID)
 	data, _ := json.MarshalIndent(in, "", "  ")
 	tmp := filepath.Join(rootDir, "inbox", "."+msgID+".tmp")
 	final := filepath.Join(rootDir, "inbox", msgID+".json")
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		logf("write inbox fail: %v", err)
-		return nil
+		return
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		logf("rename inbox fail: %v", err)
-		return nil
+		return
 	}
-	appendHistory(chatID, "user", text)
-	logf("inbox <- %s chat=%s text=%q", msgID, chatID, text)
+	appendHistory(in.ChatID, "user", in.Text)
+	if in.Recovered {
+		logf("inbox <- %s chat=%s text=%q (recovered after outage)", msgID, in.ChatID, in.Text)
+	} else {
+		logf("inbox <- %s chat=%s text=%q", msgID, in.ChatID, in.Text)
+	}
 
 	// Placeholder reply so the group sees Muse is on it; the outbox
 	// watcher later updates this very message with the real answer.
@@ -293,7 +476,217 @@ func onMessage(ctx context.Context, msg *larkim.P2MessageReceiveV1) error {
 	} else {
 		logf("placeholder reply fail: err=%v resp=%v", err, resp)
 	}
-	return nil
+}
+
+// --- catch-up sweep -------------------------------------------------
+// Feishu long connections are push-only: events that occur while the
+// client is offline (VM replacement, process death, WS drop) are never
+// redelivered — the message is simply gone. The WeChat iLink bridge
+// Andy compares this to never loses messages because its server holds
+// a poll cursor. The equivalent fix here: after any outage, fetch each
+// known chat's recent history through the message-list API and enqueue
+// whatever the live path missed. The seen registry dedupes, so the
+// sweep can run on a timer as well as at startup. Group chats need the
+// im:message.group_msg scope for this API; without it the list call
+// fails (logged, throttled) and only p2p chats are swept.
+
+var (
+	sweepMu      sync.Mutex
+	sweepErrLog  = map[string]time.Time{}
+	sweepErrMu   sync.Mutex
+)
+
+func sweepLogErr(chatID string, err error, resp *larkim.ListMessageResp) {
+	sweepErrMu.Lock()
+	last := sweepErrLog[chatID]
+	if time.Since(last) < time.Hour {
+		sweepErrMu.Unlock()
+		return
+	}
+	sweepErrLog[chatID] = time.Now()
+	sweepErrMu.Unlock()
+	if resp != nil && !resp.Success() {
+		logf("sweep: list messages for chat %s failed: code=%d msg=%s (group chats need the im:message.group_msg scope)", chatID, resp.Code, resp.Msg)
+		return
+	}
+	logf("sweep: list messages for chat %s failed: %v", chatID, err)
+}
+
+// extractListText mirrors extractText for message-list API items.
+func extractListText(item *larkim.Message) (string, bool) {
+	atBot := false
+	var mentionKey string
+	for _, at := range item.Mentions {
+		if botName != "" && larkcore.StringValue(at.Name) == botName {
+			atBot = true
+			mentionKey = larkcore.StringValue(at.Key)
+		}
+	}
+	if len(item.Mentions) > 0 && botName == "" {
+		atBot = true
+	}
+	if item.Body == nil {
+		return "", atBot
+	}
+	content := larkcore.StringValue(item.Body.Content)
+	switch larkcore.StringValue(item.MsgType) {
+	case larkim.MsgTypeText:
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(content), &body); err != nil {
+			return "", atBot
+		}
+		text := body.Text
+		if mentionKey != "" {
+			text = strings.ReplaceAll(text, mentionKey, "")
+		}
+		if botName != "" {
+			if strings.Contains(text, "@"+botName) {
+				atBot = true
+			}
+			text = strings.ReplaceAll(text, "@"+botName, "")
+		}
+		return strings.TrimSpace(text), atBot
+	case larkim.MsgTypePost:
+		type el struct {
+			Tag  string `json:"tag"`
+			Text string `json:"text"`
+		}
+		var post struct {
+			Content [][]el `json:"content"`
+			ZhCn    struct {
+				Content [][]el `json:"content"`
+			} `json:"zh_cn"`
+		}
+		if err := json.Unmarshal([]byte(content), &post); err != nil {
+			return "", atBot
+		}
+		rows := post.Content
+		if len(rows) == 0 {
+			rows = post.ZhCn.Content
+		}
+		var parts []string
+		for _, line := range rows {
+			for _, e := range line {
+				if e.Tag == "text" {
+					parts = append(parts, e.Text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, " ")), atBot
+	}
+	return "", atBot
+}
+
+func sweepMissed(ctx context.Context, lookback time.Duration) {
+	if !sweepMu.TryLock() {
+		return
+	}
+	defer sweepMu.Unlock()
+	end := time.Now()
+	start := end.Add(-lookback)
+	recovered := 0
+	for _, chatID := range knownChats() {
+		chatType, typeCertain := chatTypeOf(ctx, chatID)
+		var cands []InboxMsg
+		pageToken := ""
+		for page := 0; page < 10; page++ {
+			b := larkim.NewListMessageReqBuilder().
+				ContainerIdType("chat").
+				ContainerId(chatID).
+				StartTime(strconv.FormatInt(start.Unix(), 10)).
+				EndTime(strconv.FormatInt(end.Unix(), 10)).
+				SortType(larkim.SortTypeListMessageByCreateTimeAsc).
+				PageSize(50)
+			if pageToken != "" {
+				b = b.PageToken(pageToken)
+			}
+			resp, err := larkCli.Im.Message.List(ctx, b.Build())
+			if err != nil || resp == nil || !resp.Success() {
+				sweepLogErr(chatID, err, resp)
+				break
+			}
+			for _, item := range resp.Data.Items {
+				if item == nil || larkcore.BoolValue(item.Deleted) {
+					continue
+				}
+				if item.Sender == nil || larkcore.StringValue(item.Sender.SenderType) != "user" {
+					continue // app/anonymous: never react to bots or ourselves
+				}
+				msgID := larkcore.StringValue(item.MessageId)
+				if msgID == "" || isSeen(msgID) || isSelfSent(msgID) {
+					continue
+				}
+				text, atBot := extractListText(item)
+				if chatType == "group" && !atBot {
+					// Deliberately skipped — but only burn the id into
+					// the seen registry when the chat type is certain;
+					// a guessed "group" must not eat a p2p message.
+					if typeCertain {
+						markSeen(msgID)
+					}
+					continue
+				}
+				if strings.TrimSpace(text) == "" {
+					markSeen(msgID)
+					continue
+				}
+				created := time.Now()
+				if ms, perr := strconv.ParseInt(larkcore.StringValue(item.CreateTime), 10, 64); perr == nil && ms > 0 {
+					created = time.UnixMilli(ms)
+				}
+				cands = append(cands, InboxMsg{
+					ID: msgID, ChatID: chatID, ChatType: chatType,
+					SenderID: larkcore.StringValue(item.Sender.Id),
+					Text: text, ReceivedAt: created.Format(time.RFC3339),
+					Recovered: true,
+				})
+			}
+			if !larkcore.BoolValue(resp.Data.HasMore) {
+				break
+			}
+			pageToken = larkcore.StringValue(resp.Data.PageToken)
+			if pageToken == "" {
+				break
+			}
+		}
+		// Deliver this chat's catch-up as ONE entry when several
+		// messages piled up during the outage: a single Muse turn
+		// answers the whole backlog instead of draining it message by
+		// message (8 separate turns took ~7 minutes on 2026-11-20).
+		if len(cands) == 1 {
+			enqueue(ctx, cands[0])
+			recovered++
+		} else if len(cands) > 1 {
+			var lines []string
+			for _, c := range cands {
+				lines = append(lines, c.Text)
+				markSeen(c.ID)
+			}
+			merged := cands[len(cands)-1]
+			merged.Text = strings.Join(lines, "\n")
+			enqueue(ctx, merged)
+			recovered += len(cands)
+			logf("sweep: chat %s: merged %d missed messages into one catch-up entry", chatID, len(cands))
+		}
+	}
+	if recovered > 0 {
+		logf("sweep: recovered %d missed message(s)", recovered)
+	}
+}
+
+// sweepLoop runs the catch-up sweep shortly after startup (24h
+// lookback, covering overnight outages) and then every 2 minutes
+// (30min lookback) so even brief WS blips self-heal.
+func sweepLoop(ctx context.Context) {
+	time.Sleep(5 * time.Second)
+	sweepMissed(ctx, 24*time.Hour)
+	t := time.NewTicker(2 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		sweepMissed(ctx, 30*time.Minute)
+	}
 }
 
 // watchOutbox polls for Muse's replies and delivers them to Feishu.
@@ -576,14 +969,14 @@ func main() {
 
 	home, _ := os.UserHomeDir()
 	if *root == "" {
-		*root = filepath.Join(home, "workspace", "feishu-bridge", "bridge-data")
+		*root = filepath.Join(home, "workspace", "musebot-lark", "bridge-data")
 	}
 	rootDir = *root
 	for _, sub := range []string{"inbox", "outbox", "claimed", "done", "sent", "history"} {
 		os.MkdirAll(filepath.Join(rootDir, sub), 0755)
 	}
 	if *confPath == "" {
-		*confPath = filepath.Join(home, "workspace", "feishu-bridge", "config", "bridge.json")
+		*confPath = filepath.Join(home, "workspace", "musebot-lark", "config", "bridge.json")
 	}
 	data, err := os.ReadFile(*confPath)
 	if err != nil {
@@ -602,6 +995,8 @@ func main() {
 	}
 
 	loadPending()
+	loadSeen()
+	loadChats()
 
 	ctx := context.Background()
 	larkCli = lark.NewClient(cfg.LarkAppID, cfg.LarkAppSecret, lark.WithLogger(stdLogger{}))
@@ -619,6 +1014,7 @@ func main() {
 	}
 
 	go watchOutbox(ctx)
+	go sweepLoop(ctx)
 
 	handler := dispatcher.NewEventDispatcher("", "").OnP2MessageReceiveV1(onMessage)
 	ws := larkws.NewClient(cfg.LarkAppID, cfg.LarkAppSecret,
